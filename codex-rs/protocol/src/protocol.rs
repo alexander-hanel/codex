@@ -488,6 +488,9 @@ pub enum Op {
         communication: InterAgentCommunication,
     },
 
+    /// Structured feedback from a secondary process about the current task.
+    ExternalTaskFeedback { feedback: ExternalTaskFeedback },
+
     /// Override parts of the persistent turn context for subsequent turns.
     ///
     /// All fields are optional; when omitted, the existing value is preserved.
@@ -764,6 +767,78 @@ impl InterAgentCommunication {
     }
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExternalFeedbackSource {
+    ExternalProcess,
+    SecuritySoftware,
+    OperatingSystem,
+    User,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExternalFeedbackSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum ExternalFeedbackDisposition {
+    Informational,
+    FailedByExternalActor,
+    DoNotRetry,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[ts(tag = "type")]
+pub enum ExternalTaskFeedbackScope {
+    Session,
+    Turn {
+        turn_id: String,
+    },
+    ToolCall {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | null", optional)]
+        turn_id: Option<String>,
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | null", optional)]
+        tool_name: Option<String>,
+    },
+    Command {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | null", optional)]
+        turn_id: Option<String>,
+        command: String,
+    },
+    Path {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | null", optional)]
+        turn_id: Option<String>,
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ExternalTaskFeedback {
+    pub source: ExternalFeedbackSource,
+    pub severity: ExternalFeedbackSeverity,
+    pub disposition: ExternalFeedbackDisposition,
+    pub scope: ExternalTaskFeedbackScope,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub observed_at: Option<i64>,
+}
+
 impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -777,6 +852,7 @@ impl Op {
             Self::UserInput { .. } => "user_input",
             Self::UserTurn { .. } => "user_turn",
             Self::InterAgentCommunication { .. } => "inter_agent_communication",
+            Self::ExternalTaskFeedback { .. } => "external_task_feedback",
             Self::OverrideTurnContext { .. } => "override_turn_context",
             Self::ExecApproval { .. } => "exec_approval",
             Self::PatchApproval { .. } => "patch_approval",
@@ -1414,6 +1490,9 @@ pub enum EventMsg {
     /// Warning issued while processing a submission. Unlike `Error`, this
     /// indicates the turn continued but the user should still be notified.
     Warning(WarningEvent),
+
+    /// Structured feedback from a secondary process about current task execution.
+    ExternalTaskFeedback(ExternalTaskFeedbackEvent),
 
     /// Realtime conversation lifecycle start event.
     RealtimeConversationStarted(RealtimeConversationStartedEvent),
@@ -2059,6 +2138,11 @@ impl ErrorEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct WarningEvent {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct ExternalTaskFeedbackEvent {
+    pub feedback: ExternalTaskFeedback,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
@@ -5009,6 +5093,104 @@ mod tests {
                 assert_eq!(reason, TurnAbortReason::Interrupted);
             }
             _ => panic!("expected turn_aborted event"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn external_task_feedback_op_round_trips() -> Result<()> {
+        let op = Op::ExternalTaskFeedback {
+            feedback: ExternalTaskFeedback {
+                source: ExternalFeedbackSource::SecuritySoftware,
+                severity: ExternalFeedbackSeverity::Error,
+                disposition: ExternalFeedbackDisposition::DoNotRetry,
+                scope: ExternalTaskFeedbackScope::Command {
+                    turn_id: Some("turn-123".to_string()),
+                    command: "cargo test -p codex-core".to_string(),
+                },
+                message: "security software blocked process creation".to_string(),
+                observed_at: Some(1_712_345_678),
+            },
+        };
+
+        let json_op = serde_json::to_value(&op)?;
+        assert_eq!(
+            json_op,
+            json!({
+                "type": "external_task_feedback",
+                "feedback": {
+                    "source": "security_software",
+                    "severity": "error",
+                    "disposition": "do_not_retry",
+                    "scope": {
+                        "type": "command",
+                        "turn_id": "turn-123",
+                        "command": "cargo test -p codex-core",
+                    },
+                    "message": "security software blocked process creation",
+                    "observed_at": 1_712_345_678,
+                },
+            })
+        );
+        assert_eq!(serde_json::from_value::<Op>(json_op)?, op);
+
+        Ok(())
+    }
+
+    #[test]
+    fn external_task_feedback_event_round_trips() -> Result<()> {
+        let event = EventMsg::ExternalTaskFeedback(ExternalTaskFeedbackEvent {
+            feedback: ExternalTaskFeedback {
+                source: ExternalFeedbackSource::ExternalProcess,
+                severity: ExternalFeedbackSeverity::Warning,
+                disposition: ExternalFeedbackDisposition::FailedByExternalActor,
+                scope: ExternalTaskFeedbackScope::Path {
+                    turn_id: None,
+                    path: PathBuf::from("codex-rs/core/src/session/mod.rs"),
+                },
+                message: "file was locked by another process".to_string(),
+                observed_at: None,
+            },
+        });
+
+        let json_event = serde_json::to_value(&event)?;
+        assert_eq!(
+            json_event,
+            json!({
+                "type": "external_task_feedback",
+                "feedback": {
+                    "source": "external_process",
+                    "severity": "warning",
+                    "disposition": "failed_by_external_actor",
+                    "scope": {
+                        "type": "path",
+                        "path": PathBuf::from("codex-rs/core/src/session/mod.rs"),
+                    },
+                    "message": "file was locked by another process",
+                },
+            })
+        );
+        match serde_json::from_value::<EventMsg>(json_event)? {
+            EventMsg::ExternalTaskFeedback(observed_event) => {
+                assert_eq!(
+                    observed_event,
+                    ExternalTaskFeedbackEvent {
+                        feedback: ExternalTaskFeedback {
+                            source: ExternalFeedbackSource::ExternalProcess,
+                            severity: ExternalFeedbackSeverity::Warning,
+                            disposition: ExternalFeedbackDisposition::FailedByExternalActor,
+                            scope: ExternalTaskFeedbackScope::Path {
+                                turn_id: None,
+                                path: PathBuf::from("codex-rs/core/src/session/mod.rs"),
+                            },
+                            message: "file was locked by another process".to_string(),
+                            observed_at: None,
+                        },
+                    }
+                );
+            }
+            other => panic!("expected external_task_feedback event, got {other:?}"),
         }
 
         Ok(())

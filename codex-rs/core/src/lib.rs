@@ -34,6 +34,7 @@ pub mod exec;
 pub mod exec_env;
 mod exec_policy;
 pub mod external_agent_config;
+mod external_task_feedback_inbox_watcher;
 pub mod file_watcher;
 mod flags;
 #[cfg(test)]

@@ -276,11 +276,12 @@ impl ToolOutput for FunctionToolOutput {
 
 pub struct ApplyPatchToolOutput {
     pub text: String,
+    pub success: Option<bool>,
 }
 
 impl ApplyPatchToolOutput {
-    pub fn from_text(text: String) -> Self {
-        Self { text }
+    pub fn from_text(text: String, success: Option<bool>) -> Self {
+        Self { text, success }
     }
 }
 
@@ -290,7 +291,7 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        true
+        self.success.unwrap_or(true)
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -300,7 +301,7 @@ impl ToolOutput for ApplyPatchToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.text.clone(),
             }],
-            Some(true),
+            self.success,
         )
     }
 

@@ -2,6 +2,11 @@ use super::*;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::protocol::ExternalFeedbackDisposition;
+use codex_protocol::protocol::ExternalFeedbackSeverity;
+use codex_protocol::protocol::ExternalFeedbackSource;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackScope;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::SandboxPolicy;
 use core_test_support::PathBufExt;
@@ -10,6 +15,13 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tempfile::TempDir;
+use tokio::sync::Mutex;
+
+use crate::session::tests::make_session_and_context;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolHandler;
+use crate::turn_diff_tracker::TurnDiffTracker;
 
 #[test]
 fn diff_consumer_does_not_stream_json_tool_call_arguments() {
@@ -151,4 +163,38 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
         permissions.and_then(|profile| profile.file_system.and_then(|fs| fs.write)),
         Some(vec![expected_outside])
     );
+}
+
+#[tokio::test]
+async fn apply_patch_handler_short_circuits_blocked_path_feedback() {
+    let (session, turn) = make_session_and_context().await;
+    session
+        .record_external_task_feedback(ExternalTaskFeedback {
+            source: ExternalFeedbackSource::ExternalProcess,
+            severity: ExternalFeedbackSeverity::Error,
+            disposition: ExternalFeedbackDisposition::DoNotRetry,
+            scope: ExternalTaskFeedbackScope::Path {
+                turn_id: Some(turn.sub_id.clone()),
+                path: PathBuf::from("blocked.txt"),
+            },
+            message: "file is locked by another process".to_string(),
+            observed_at: None,
+        })
+        .await;
+
+    let patch = "*** Begin Patch\n*** Add File: blocked.txt\n+hello\n*** End Patch".to_string();
+    let output = ApplyPatchHandler
+        .handle(ToolInvocation {
+            session: session.into(),
+            turn: turn.into(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-patch-blocked".to_string(),
+            tool_name: codex_tools::ToolName::plain("apply_patch"),
+            payload: ToolPayload::Custom { input: patch },
+        })
+        .await
+        .expect("apply_patch handler should return a model-visible failure");
+
+    assert_eq!(output.success, Some(false));
+    assert!(output.text.contains("Do not retry this patch"));
 }

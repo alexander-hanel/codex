@@ -22,6 +22,12 @@ use crate::config::ManagedFeatures;
 use crate::connectors;
 use crate::default_skill_metadata_budget;
 use crate::exec_policy::ExecPolicyManager;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxEnvelope;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxWatcherEvent;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackSessionRegistration;
+use crate::external_task_feedback_inbox_watcher::external_task_feedback_inbox_dir;
+use crate::external_task_feedback_inbox_watcher::external_task_feedback_session_registry_path;
+use crate::external_task_feedback_inbox_watcher::external_task_feedback_targets_thread;
 use crate::installation_id::resolve_installation_id;
 use crate::parse_turn_item;
 use crate::path_utils::normalize_for_native_workdir;
@@ -88,6 +94,9 @@ use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::ExternalFeedbackDisposition;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackScope;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::HasLegacyEvent;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -653,10 +662,17 @@ impl Codex {
 
         // This task will run until Op::Shutdown is received.
         let session_for_loop = Arc::clone(&session);
+        let session_for_cleanup = Arc::clone(&session);
         let session_loop_handle = tokio::spawn(async move {
             submission_loop(session_for_loop, config, rx_sub)
                 .instrument(info_span!("session_loop", thread_id = %thread_id))
                 .await;
+            if let Err(err) = session_for_cleanup
+                .remove_external_task_feedback_session_registration()
+                .await
+            {
+                warn!("failed to remove external task feedback session registry: {err}");
+            }
         });
         let codex = Codex {
             tx_sub,
@@ -962,6 +978,64 @@ impl Session {
                             msg: EventMsg::SkillsUpdateAvailable,
                         };
                         sess.send_event_raw(event).await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    async fn initialize_external_task_feedback_ipc(self: &Arc<Self>) {
+        if let Err(err) = self
+            .publish_external_task_feedback_session_registration()
+            .await
+        {
+            warn!("failed to publish external task feedback session registry: {err}");
+        }
+
+        let codex_home = self.codex_home().await;
+        match self
+            .services
+            .external_task_feedback_inbox_watcher
+            .register_inbox(&codex_home)
+            .await
+        {
+            Ok(registration) => {
+                let mut guard = self.external_task_feedback_watch_registration.lock().await;
+                *guard = Some(registration);
+            }
+            Err(err) => {
+                warn!("failed to register external task feedback inbox watcher: {err}");
+                return;
+            }
+        }
+
+        if let Err(err) = self.scan_external_task_feedback_inbox().await {
+            warn!("failed to scan external task feedback inbox: {err}");
+        }
+    }
+
+    fn start_external_task_feedback_inbox_listener(self: &Arc<Self>) {
+        let mut rx = self
+            .services
+            .external_task_feedback_inbox_watcher
+            .subscribe();
+        let weak_sess = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ExternalTaskFeedbackInboxWatcherEvent::InboxChanged { paths }) => {
+                        let Some(sess) = weak_sess.upgrade() else {
+                            break;
+                        };
+                        for path in paths {
+                            if let Err(err) =
+                                sess.ingest_external_task_feedback_inbox_file(path).await
+                            {
+                                warn!("failed to ingest external task feedback inbox file: {err}");
+                            }
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2194,6 +2268,15 @@ impl Session {
         state.record_items(items.iter(), turn_context.truncation_policy);
     }
 
+    pub(crate) async fn record_conversation_items_without_active_turn(
+        &self,
+        items: &[ResponseItem],
+    ) {
+        let turn_context = self.new_default_turn().await;
+        self.record_into_history(items, turn_context.as_ref()).await;
+        self.persist_rollout_response_items(items).await;
+    }
+
     pub(crate) async fn record_model_warning(&self, message: impl Into<String>, ctx: &TurnContext) {
         self.services
             .session_telemetry
@@ -2656,6 +2739,153 @@ impl Session {
         state.set_dependency_env(values);
     }
 
+    async fn publish_external_task_feedback_session_registration(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<()> {
+        let codex_home = self.codex_home().await;
+        let registry_path =
+            external_task_feedback_session_registry_path(&codex_home, self.conversation_id);
+        let inbox_path = external_task_feedback_inbox_dir(&codex_home);
+        let created_at = Utc::now().timestamp();
+        let registration = ExternalTaskFeedbackSessionRegistration {
+            thread_id: self.conversation_id,
+            process_id: std::process::id(),
+            cwd: {
+                let state = self.state.lock().await;
+                state.session_configuration.cwd.as_path().to_path_buf()
+            },
+            inbox_path,
+            created_at,
+        };
+        write_json_atomic(
+            &registry_path,
+            &serde_json::to_vec_pretty(&registration)
+                .map_err(|err| anyhow::anyhow!("serialize session registration: {err}"))?,
+        )
+        .await
+    }
+
+    async fn remove_external_task_feedback_session_registration(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<()> {
+        let codex_home = self.codex_home().await;
+        let registry_path =
+            external_task_feedback_session_registry_path(&codex_home, self.conversation_id);
+        match tokio::fs::remove_file(&registry_path).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(anyhow::anyhow!(
+                "remove session registry {}: {err}",
+                registry_path.display()
+            )),
+        }
+    }
+
+    async fn scan_external_task_feedback_inbox(self: &Arc<Self>) -> anyhow::Result<()> {
+        let inbox_dir = external_task_feedback_inbox_dir(&self.codex_home().await);
+        let mut entries = match tokio::fs::read_dir(&inbox_dir).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(anyhow::anyhow!(
+                    "read inbox dir {}: {err}",
+                    inbox_dir.display()
+                ));
+            }
+        };
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| anyhow::anyhow!("read inbox entry {}: {err}", inbox_dir.display()))?
+        {
+            self.ingest_external_task_feedback_inbox_file(entry.path())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn ingest_external_task_feedback_inbox_file(
+        self: &Arc<Self>,
+        path: PathBuf,
+    ) -> anyhow::Result<()> {
+        if !external_task_feedback_targets_thread(&path, self.conversation_id) {
+            return Ok(());
+        }
+
+        let bytes = tokio::fs::read(&path)
+            .await
+            .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?;
+        let envelope: ExternalTaskFeedbackInboxEnvelope = serde_json::from_slice(&bytes)
+            .map_err(|err| anyhow::anyhow!("parse {}: {err}", path.display()))?;
+        if envelope.thread_id != self.conversation_id {
+            return Ok(());
+        }
+
+        handlers::external_task_feedback(self, self.next_internal_sub_id(), envelope.feedback)
+            .await;
+
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|err| anyhow::anyhow!("remove {}: {err}", path.display()))?;
+        Ok(())
+    }
+
+    pub(crate) async fn refresh_external_task_feedback_inbox(
+        self: &Arc<Self>,
+    ) -> anyhow::Result<()> {
+        self.scan_external_task_feedback_inbox().await
+    }
+
+    pub(crate) async fn record_external_task_feedback(
+        &self,
+        feedback: ExternalTaskFeedback,
+    ) -> ExternalTaskFeedback {
+        let mut state = self.state.lock().await;
+        state.record_external_task_feedback(feedback.clone());
+        feedback
+    }
+
+    pub(crate) async fn blocked_external_feedback_for_command(
+        &self,
+        turn_context: &TurnContext,
+        command: &str,
+    ) -> Option<ExternalTaskFeedback> {
+        self.find_blocking_external_feedback(|feedback| {
+            feedback_matches_command(feedback, Some(turn_context.sub_id.as_str()), command)
+        })
+        .await
+    }
+
+    pub(crate) async fn blocked_external_feedback_for_paths(
+        &self,
+        turn_context: &TurnContext,
+        paths: &[AbsolutePathBuf],
+    ) -> Option<ExternalTaskFeedback> {
+        self.find_blocking_external_feedback(|feedback| {
+            feedback_matches_paths(
+                feedback,
+                Some(turn_context.sub_id.as_str()),
+                &turn_context.cwd,
+                paths,
+            )
+        })
+        .await
+    }
+
+    async fn find_blocking_external_feedback<F>(&self, matcher: F) -> Option<ExternalTaskFeedback>
+    where
+        F: Fn(&ExternalTaskFeedback) -> bool,
+    {
+        let state = self.state.lock().await;
+        state
+            .external_task_feedback()
+            .iter()
+            .rev()
+            .find(|feedback| matcher(feedback))
+            .cloned()
+    }
+
     pub(crate) async fn set_server_reasoning_included(&self, included: bool) {
         let mut state = self.state.lock().await;
         state.set_server_reasoning_included(included);
@@ -2847,6 +3077,16 @@ impl Session {
         }
     }
 
+    pub(crate) async fn inject_or_queue_response_items(&self, items: Vec<ResponseInputItem>) {
+        if items.is_empty() {
+            return;
+        }
+
+        if let Err(items) = self.inject_response_items(items).await {
+            self.queue_response_items_for_next_turn(items).await;
+        }
+    }
+
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(&self, sub_id: &str) {
         let turn_state = self.turn_state_for_sub_id(sub_id).await;
         let Some(turn_state) = turn_state else {
@@ -2944,7 +3184,6 @@ impl Session {
     }
 
     /// Queue response items to be injected into the next active turn created for this session.
-    #[cfg(test)]
     pub(crate) async fn queue_response_items_for_next_turn(&self, items: Vec<ResponseInputItem>) {
         if items.is_empty() {
             return;
@@ -3113,6 +3352,87 @@ fn errors_to_info(errors: &[SkillError]) -> Vec<SkillErrorInfo> {
             message: err.message.clone(),
         })
         .collect()
+}
+
+fn feedback_blocks_retry(feedback: &ExternalTaskFeedback) -> bool {
+    matches!(
+        feedback.disposition,
+        ExternalFeedbackDisposition::FailedByExternalActor
+            | ExternalFeedbackDisposition::DoNotRetry
+    )
+}
+
+fn feedback_scope_matches_turn(turn_id: &Option<String>, current_turn_id: Option<&str>) -> bool {
+    turn_id
+        .as_deref()
+        .is_none_or(|expected_turn_id| Some(expected_turn_id) == current_turn_id)
+}
+
+fn feedback_matches_command(
+    feedback: &ExternalTaskFeedback,
+    current_turn_id: Option<&str>,
+    command: &str,
+) -> bool {
+    if !feedback_blocks_retry(feedback) {
+        return false;
+    }
+
+    match &feedback.scope {
+        ExternalTaskFeedbackScope::Session => true,
+        ExternalTaskFeedbackScope::Command {
+            turn_id,
+            command: blocked_command,
+        } => feedback_scope_matches_turn(turn_id, current_turn_id) && blocked_command == command,
+        ExternalTaskFeedbackScope::Turn { turn_id } => Some(turn_id.as_str()) == current_turn_id,
+        ExternalTaskFeedbackScope::ToolCall { .. } | ExternalTaskFeedbackScope::Path { .. } => {
+            false
+        }
+    }
+}
+
+fn feedback_matches_paths(
+    feedback: &ExternalTaskFeedback,
+    current_turn_id: Option<&str>,
+    cwd: &AbsolutePathBuf,
+    paths: &[AbsolutePathBuf],
+) -> bool {
+    if !feedback_blocks_retry(feedback) {
+        return false;
+    }
+
+    match &feedback.scope {
+        ExternalTaskFeedbackScope::Session => true,
+        ExternalTaskFeedbackScope::Turn { turn_id } => Some(turn_id.as_str()) == current_turn_id,
+        ExternalTaskFeedbackScope::Path { turn_id, path } => {
+            feedback_scope_matches_turn(turn_id, current_turn_id)
+                && paths.contains(&AbsolutePathBuf::resolve_path_against_base(
+                    path.as_path(),
+                    cwd,
+                ))
+        }
+        ExternalTaskFeedbackScope::ToolCall { .. } | ExternalTaskFeedbackScope::Command { .. } => {
+            false
+        }
+    }
+}
+
+async fn write_json_atomic(path: &PathBuf, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|err| anyhow::anyhow!("create dir {}: {err}", parent.display()))?;
+    }
+    let temp_path = path.with_extension("tmp");
+    tokio::fs::write(&temp_path, bytes)
+        .await
+        .map_err(|err| anyhow::anyhow!("write {}: {err}", temp_path.display()))?;
+    tokio::fs::rename(&temp_path, path).await.map_err(|err| {
+        anyhow::anyhow!(
+            "rename {} to {}: {err}",
+            temp_path.display(),
+            path.display()
+        )
+    })
 }
 
 use crate::memories::prompts::build_memory_tool_developer_instructions;

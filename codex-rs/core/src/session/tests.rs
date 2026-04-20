@@ -10,6 +10,11 @@ use crate::config_loader::RequirementSource;
 use crate::config_loader::Sourced;
 use crate::config_loader::project_trust_key;
 use crate::exec::ExecCapturePolicy;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxEnvelope;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxWatcher;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackSessionRegistration;
+use crate::external_task_feedback_inbox_watcher::external_task_feedback_inbox_dir;
+use crate::external_task_feedback_inbox_watcher::external_task_feedback_session_registry_path;
 use crate::function_tool::FunctionCallError;
 use crate::shell::default_user_shell;
 use crate::skills::SkillRenderSideEffects;
@@ -81,6 +86,12 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::ConversationAudioParams;
 use codex_protocol::protocol::CreditsSnapshot;
+use codex_protocol::protocol::ExternalFeedbackDisposition;
+use codex_protocol::protocol::ExternalFeedbackSeverity;
+use codex_protocol::protocol::ExternalFeedbackSource;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackEvent;
+use codex_protocol::protocol::ExternalTaskFeedbackScope;
 use codex_protocol::protocol::GranularApprovalConfig;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -3088,6 +3099,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         plugins_manager,
         mcp_manager,
         skills_watcher,
+        external_task_feedback_inbox_watcher: Arc::new(ExternalTaskFeedbackInboxWatcher::noop()),
         agent_control,
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
@@ -3168,6 +3180,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
+        external_task_feedback_watch_registration: Mutex::new(None),
     };
 
     (session, turn_context)
@@ -4051,6 +4064,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         plugins_manager,
         mcp_manager,
         skills_watcher,
+        external_task_feedback_inbox_watcher: Arc::new(ExternalTaskFeedbackInboxWatcher::noop()),
         agent_control,
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
@@ -4131,6 +4145,7 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         services,
         js_repl,
         next_internal_sub_id: AtomicU64::new(0),
+        external_task_feedback_watch_registration: Mutex::new(None),
     });
 
     (session, turn_context, rx_event)
@@ -4144,6 +4159,240 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+#[tokio::test]
+async fn external_task_feedback_handler_records_and_emits_event() {
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let feedback = ExternalTaskFeedback {
+        source: ExternalFeedbackSource::SecuritySoftware,
+        severity: ExternalFeedbackSeverity::Error,
+        disposition: ExternalFeedbackDisposition::DoNotRetry,
+        scope: ExternalTaskFeedbackScope::Command {
+            turn_id: Some(turn_context.sub_id.clone()),
+            command: "echo blocked".to_string(),
+        },
+        message: "security software blocked process creation".to_string(),
+        observed_at: Some(1_712_345_678),
+    };
+
+    super::handlers::external_task_feedback(
+        &session,
+        "sub-external-feedback".to_string(),
+        feedback.clone(),
+    )
+    .await;
+
+    let event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("external feedback event should arrive")
+        .expect("external feedback event should be readable");
+
+    match event.msg {
+        EventMsg::ExternalTaskFeedback(ExternalTaskFeedbackEvent {
+            feedback: observed_feedback,
+        }) => {
+            assert_eq!(observed_feedback, feedback.clone());
+        }
+        other => panic!("expected external task feedback event, got {other:?}"),
+    }
+
+    let stored = session
+        .blocked_external_feedback_for_command(turn_context.as_ref(), "echo blocked")
+        .await;
+    assert_eq!(stored, Some(feedback));
+}
+
+#[tokio::test]
+async fn external_task_feedback_handler_injects_model_visible_message_into_active_turn() {
+    let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: false,
+            },
+        )
+        .await;
+
+    super::handlers::external_task_feedback(
+        &session,
+        "sub-external-feedback".to_string(),
+        ExternalTaskFeedback {
+            source: ExternalFeedbackSource::SecuritySoftware,
+            severity: ExternalFeedbackSeverity::Error,
+            disposition: ExternalFeedbackDisposition::DoNotRetry,
+            scope: ExternalTaskFeedbackScope::Command {
+                turn_id: Some(turn_context.sub_id.clone()),
+                command: "git status".to_string(),
+            },
+            message: "endpoint protection blocked process creation".to_string(),
+            observed_at: Some(1_712_345_680),
+        },
+    )
+    .await;
+
+    let pending = session.get_pending_input().await;
+    assert_eq!(pending.len(), 1);
+    let ResponseInputItem::Message { role, content } = &pending[0] else {
+        panic!("expected developer message");
+    };
+    assert_eq!(role, "developer");
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected developer text");
+    };
+    assert!(text.contains("External task feedback received from a secondary process."));
+    assert!(text.contains("Source: security_software"));
+    assert!(text.contains("Disposition: do_not_retry"));
+    assert!(text.contains("Scope: command `git status`"));
+    assert!(text.contains("Message: endpoint protection blocked process creation"));
+}
+
+#[tokio::test]
+async fn external_task_feedback_handler_records_model_visible_message_when_idle() {
+    let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
+
+    super::handlers::external_task_feedback(
+        &session,
+        "sub-external-feedback".to_string(),
+        ExternalTaskFeedback {
+            source: ExternalFeedbackSource::ExternalProcess,
+            severity: ExternalFeedbackSeverity::Warning,
+            disposition: ExternalFeedbackDisposition::FailedByExternalActor,
+            scope: ExternalTaskFeedbackScope::Path {
+                turn_id: Some(turn_context.sub_id.clone()),
+                path: "/repo/blocked.txt".into(),
+            },
+            message: "another process has the file locked".to_string(),
+            observed_at: None,
+        },
+    )
+    .await;
+
+    let history = session
+        .clone_history()
+        .await
+        .for_prompt(&turn_context.model_info.input_modalities);
+    let developer_message = history
+        .iter()
+        .find_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                Some((role, content))
+            }
+            _ => None,
+        })
+        .expect("expected developer message");
+    let (role, content) = developer_message;
+    assert_eq!(role, "developer");
+    let [ContentItem::InputText { text }] = content.as_slice() else {
+        panic!("expected developer message");
+    };
+    assert!(text.contains("Severity: warning"));
+    assert!(text.contains("Disposition: failed_by_external_actor"));
+    assert!(text.contains("Scope: path `/repo/blocked.txt`"));
+    assert!(text.contains("Message: another process has the file locked"));
+}
+
+#[tokio::test]
+async fn external_task_feedback_session_registration_is_written() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    session.initialize_external_task_feedback_ipc().await;
+
+    let codex_home = session.codex_home().await;
+    let registry_path =
+        external_task_feedback_session_registry_path(&codex_home, session.conversation_id);
+    let registration: ExternalTaskFeedbackSessionRegistration = serde_json::from_slice(
+        &tokio::fs::read(&registry_path)
+            .await
+            .expect("read session registry"),
+    )
+    .expect("parse session registry");
+
+    assert_eq!(registration.thread_id, session.conversation_id);
+    assert_eq!(
+        registration.inbox_path,
+        external_task_feedback_inbox_dir(&codex_home)
+    );
+}
+
+#[tokio::test]
+async fn external_task_feedback_session_registration_is_removed() {
+    let (session, _turn_context, _rx_event) = make_session_and_context_with_rx().await;
+    session.initialize_external_task_feedback_ipc().await;
+
+    let codex_home = session.codex_home().await;
+    let registry_path =
+        external_task_feedback_session_registry_path(&codex_home, session.conversation_id);
+    assert!(
+        tokio::fs::metadata(&registry_path).await.is_ok(),
+        "session registry should exist after initialization"
+    );
+
+    session
+        .remove_external_task_feedback_session_registration()
+        .await
+        .expect("remove session registry");
+
+    assert!(
+        tokio::fs::metadata(&registry_path).await.is_err(),
+        "session registry should be removed"
+    );
+}
+
+#[tokio::test]
+async fn external_task_feedback_inbox_file_is_ingested() {
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    session.initialize_external_task_feedback_ipc().await;
+
+    let feedback = ExternalTaskFeedback {
+        source: ExternalFeedbackSource::ExternalProcess,
+        severity: ExternalFeedbackSeverity::Error,
+        disposition: ExternalFeedbackDisposition::DoNotRetry,
+        scope: ExternalTaskFeedbackScope::Command {
+            turn_id: Some(turn_context.sub_id.clone()),
+            command: "echo inbox".to_string(),
+        },
+        message: "external policy denied execution".to_string(),
+        observed_at: Some(1_712_345_679),
+    };
+    let inbox_dir = external_task_feedback_inbox_dir(&session.codex_home().await);
+    let inbox_path = inbox_dir.join(format!("{}.blocked.json", session.conversation_id));
+    tokio::fs::write(
+        &inbox_path,
+        serde_json::to_vec(&ExternalTaskFeedbackInboxEnvelope {
+            version: 1,
+            thread_id: session.conversation_id,
+            feedback: feedback.clone(),
+        })
+        .expect("serialize inbox envelope"),
+    )
+    .await
+    .expect("write inbox file");
+
+    session
+        .ingest_external_task_feedback_inbox_file(inbox_path.clone())
+        .await
+        .expect("ingest inbox file");
+
+    let event = timeout(Duration::from_secs(1), rx_event.recv())
+        .await
+        .expect("external feedback event should arrive")
+        .expect("external feedback event should be readable");
+    match event.msg {
+        EventMsg::ExternalTaskFeedback(ExternalTaskFeedbackEvent {
+            feedback: observed_feedback,
+        }) => {
+            assert_eq!(observed_feedback, feedback.clone());
+        }
+        other => panic!("expected external task feedback event, got {other:?}"),
+    }
+
+    assert!(
+        tokio::fs::metadata(&inbox_path).await.is_err(),
+        "inbox file should be removed after ingestion"
+    );
 }
 
 #[tokio::test]

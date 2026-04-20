@@ -36,6 +36,7 @@ use codex_features::Feature;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExternalTaskFeedback;
 use codex_protocol::protocol::FileChange;
 use codex_protocol::protocol::PatchApplyUpdatedEvent;
 use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
@@ -174,6 +175,21 @@ fn to_abs_path(cwd: &AbsolutePathBuf, path: &Path) -> Option<AbsolutePathBuf> {
     Some(AbsolutePathBuf::resolve_path_against_base(path, cwd))
 }
 
+fn external_feedback_apply_patch_message(
+    feedback: &ExternalTaskFeedback,
+    paths: &[AbsolutePathBuf],
+) -> String {
+    let touched_paths = paths
+        .iter()
+        .map(|path| path.as_path().display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Patch application was blocked by {:?}: {}\nPaths: {touched_paths}\nDo not retry this patch until the external condition is cleared.",
+        feedback.source, feedback.message
+    )
+}
+
 fn write_permissions_for_paths(
     file_paths: &[AbsolutePathBuf],
     file_system_sandbox_policy: &codex_protocol::permissions::FileSystemSandboxPolicy,
@@ -308,12 +324,21 @@ impl ToolHandler for ApplyPatchHandler {
             codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
                 let (file_paths, effective_additional_permissions, file_system_sandbox_policy) =
                     effective_patch_permissions(session.as_ref(), turn.as_ref(), &changes).await;
+                if let Some(feedback) = session
+                    .blocked_external_feedback_for_paths(turn.as_ref(), &file_paths)
+                    .await
+                {
+                    return Ok(ApplyPatchToolOutput::from_text(
+                        external_feedback_apply_patch_message(&feedback, &file_paths),
+                        Some(false),
+                    ));
+                }
                 match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                     .await
                 {
                     InternalApplyPatchInvocation::Output(item) => {
                         let content = item?;
-                        Ok(ApplyPatchToolOutput::from_text(content))
+                        Ok(ApplyPatchToolOutput::from_text(content, Some(true)))
                     }
                     InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
                         let changes = convert_apply_patch_to_protocol(&apply.action);
@@ -363,7 +388,7 @@ impl ToolHandler for ApplyPatchHandler {
                             Some(&tracker),
                         );
                         let content = emitter.finish(event_ctx, out).await?;
-                        Ok(ApplyPatchToolOutput::from_text(content))
+                        Ok(ApplyPatchToolOutput::from_text(content, Some(true)))
                     }
                 }
             }
@@ -417,6 +442,15 @@ pub(crate) async fn intercept_apply_patch(
                 .await;
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =
                 effective_patch_permissions(session.as_ref(), turn.as_ref(), &changes).await;
+            if let Some(feedback) = session
+                .blocked_external_feedback_for_paths(turn.as_ref(), &approval_keys)
+                .await
+            {
+                return Ok(Some(FunctionToolOutput::from_text(
+                    external_feedback_apply_patch_message(&feedback, &approval_keys),
+                    Some(false),
+                )));
+            }
             match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                 .await
             {

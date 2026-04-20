@@ -40,6 +40,8 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackEvent;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::ListSkillsResponseEvent;
 use codex_protocol::protocol::McpServerRefreshConfig;
@@ -66,6 +68,10 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::mcp::RequestId as ProtocolRequestId;
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::DeveloperInstructions;
+use codex_protocol::models::ResponseInputItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::user_input::UserInput;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
@@ -269,6 +275,101 @@ pub async fn inter_agent_communication(
         sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
             .await;
     }
+}
+
+pub async fn external_task_feedback(
+    sess: &Arc<Session>,
+    sub_id: String,
+    feedback: ExternalTaskFeedback,
+) {
+    let feedback = sess.record_external_task_feedback(feedback).await;
+    let text = format_external_task_feedback_for_model(&feedback);
+    let message: ResponseItem = DeveloperInstructions::new(text.clone()).into();
+
+    if sess
+        .active_turn_context_and_cancellation_token()
+        .await
+        .is_some()
+    {
+        sess.inject_or_queue_response_items(vec![ResponseInputItem::Message {
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText { text }],
+        }])
+        .await;
+    } else {
+        sess.record_conversation_items_without_active_turn(std::slice::from_ref(&message))
+            .await;
+    }
+
+    sess.send_event_raw(Event {
+        id: sub_id,
+        msg: EventMsg::ExternalTaskFeedback(ExternalTaskFeedbackEvent { feedback }),
+    })
+    .await;
+}
+
+fn format_external_task_feedback_for_model(feedback: &ExternalTaskFeedback) -> String {
+    let scope = match &feedback.scope {
+        codex_protocol::protocol::ExternalTaskFeedbackScope::Session => "session".to_string(),
+        codex_protocol::protocol::ExternalTaskFeedbackScope::Turn { turn_id } => {
+            format!("turn {turn_id}")
+        }
+        codex_protocol::protocol::ExternalTaskFeedbackScope::ToolCall {
+            turn_id,
+            call_id,
+            tool_name,
+        } => {
+            let mut scope = format!("tool_call {call_id}");
+            if let Some(tool_name) = tool_name {
+                scope.push_str(&format!(" ({tool_name})"));
+            }
+            if let Some(turn_id) = turn_id {
+                scope.push_str(&format!(" in turn {turn_id}"));
+            }
+            scope
+        }
+        codex_protocol::protocol::ExternalTaskFeedbackScope::Command { turn_id, command } => {
+            match turn_id {
+                Some(turn_id) => format!("command `{command}` in turn {turn_id}"),
+                None => format!("command `{command}`"),
+            }
+        }
+        codex_protocol::protocol::ExternalTaskFeedbackScope::Path { turn_id, path } => {
+            match turn_id {
+                Some(turn_id) => format!("path `{}` in turn {turn_id}", path.display()),
+                None => format!("path `{}`", path.display()),
+            }
+        }
+    };
+
+    let source = match feedback.source {
+        codex_protocol::protocol::ExternalFeedbackSource::ExternalProcess => "external_process",
+        codex_protocol::protocol::ExternalFeedbackSource::SecuritySoftware => "security_software",
+        codex_protocol::protocol::ExternalFeedbackSource::OperatingSystem => "operating_system",
+        codex_protocol::protocol::ExternalFeedbackSource::User => "user",
+        codex_protocol::protocol::ExternalFeedbackSource::Other => "other",
+    };
+    let severity = match feedback.severity {
+        codex_protocol::protocol::ExternalFeedbackSeverity::Info => "info",
+        codex_protocol::protocol::ExternalFeedbackSeverity::Warning => "warning",
+        codex_protocol::protocol::ExternalFeedbackSeverity::Error => "error",
+    };
+    let disposition = match feedback.disposition {
+        codex_protocol::protocol::ExternalFeedbackDisposition::Informational => "informational",
+        codex_protocol::protocol::ExternalFeedbackDisposition::FailedByExternalActor => {
+            "failed_by_external_actor"
+        }
+        codex_protocol::protocol::ExternalFeedbackDisposition::DoNotRetry => "do_not_retry",
+    };
+    let observed_at = feedback
+        .observed_at
+        .map(|ts| format!("\nObservedAt: {ts}"))
+        .unwrap_or_default();
+
+    format!(
+        "External task feedback received from a secondary process. Treat this as current runtime context for the task and incorporate it into subsequent decisions.\nSource: {source}\nSeverity: {severity}\nDisposition: {disposition}\nScope: {scope}\nMessage: {}{observed_at}\nIf this feedback indicates a command or file access was blocked externally, avoid blind retries and explain the external condition.",
+        feedback.message
+    )
 }
 
 pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command: String) {
@@ -1088,6 +1189,10 @@ pub(super) async fn submission_loop(
                 }
                 Op::InterAgentCommunication { communication } => {
                     inter_agent_communication(&sess, sub.id.clone(), communication).await;
+                    false
+                }
+                Op::ExternalTaskFeedback { feedback } => {
+                    external_task_feedback(&sess, sub.id.clone(), feedback).await;
                     false
                 }
                 Op::ExecApproval {

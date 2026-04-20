@@ -201,6 +201,27 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
 }
 
 impl ToolRuntime<ApplyPatchRequest, ExecToolCallOutput> for ApplyPatchRuntime {
+    async fn retry_blocked_by_external_feedback(
+        &self,
+        req: &ApplyPatchRequest,
+        ctx: &ToolCtx,
+    ) -> Option<ToolError> {
+        let feedback = ctx
+            .session
+            .blocked_external_feedback_for_paths(ctx.turn.as_ref(), &req.file_paths)
+            .await?;
+        let touched_paths = req
+            .file_paths
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Some(ToolError::Rejected(format!(
+            "Patch application was blocked by {:?}: {}\nPaths: {touched_paths}\nDo not retry this patch until the external condition is cleared.",
+            feedback.source, feedback.message
+        )))
+    }
+
     async fn run(
         &mut self,
         req: &ApplyPatchRequest,

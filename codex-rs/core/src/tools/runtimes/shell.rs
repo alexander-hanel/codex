@@ -226,6 +226,21 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         })
     }
 
+    async fn retry_blocked_by_external_feedback(
+        &self,
+        req: &ShellRequest,
+        ctx: &ToolCtx,
+    ) -> Option<ToolError> {
+        let feedback = ctx
+            .session
+            .blocked_external_feedback_for_command(ctx.turn.as_ref(), &req.hook_command)
+            .await?;
+        Some(ToolError::Rejected(format!(
+            "Command execution was blocked by {:?}: {}\nCommand: {}\nDo not retry this command until the external condition is cleared.",
+            feedback.source, feedback.message, req.hook_command
+        )))
+    }
+
     async fn run(
         &mut self,
         req: &ShellRequest,

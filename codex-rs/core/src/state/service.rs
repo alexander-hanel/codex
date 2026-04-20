@@ -8,6 +8,7 @@ use crate::agent_identity::AgentIdentityManager;
 use crate::client::ModelClient;
 use crate::config::StartedNetworkProxy;
 use crate::exec_policy::ExecPolicyManager;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxWatcher;
 use crate::guardian::GuardianRejection;
 use crate::mcp::McpManager;
 use crate::plugins::PluginsManager;
@@ -56,6 +57,7 @@ pub(crate) struct SessionServices {
     pub(crate) plugins_manager: Arc<PluginsManager>,
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) skills_watcher: Arc<SkillsWatcher>,
+    pub(crate) external_task_feedback_inbox_watcher: Arc<ExternalTaskFeedbackInboxWatcher>,
     pub(crate) agent_control: AgentControl,
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) network_approval: Arc<NetworkApprovalService>,

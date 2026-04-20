@@ -37,6 +37,7 @@ use crate::tools::sandboxing::ToolCtx;
 use codex_features::Feature;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_protocol::protocol::ExternalTaskFeedback;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_tools::ShellCommandBackendConfig;
 
@@ -72,6 +73,13 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
     parse_arguments::<ShellCommandToolCallParams>(arguments)
         .ok()
         .map(|params| params.command)
+}
+
+fn external_feedback_shell_message(feedback: &ExternalTaskFeedback, command: &str) -> String {
+    format!(
+        "Command execution was blocked by {:?}: {}\nCommand: {command}\nDo not retry this command until the external condition is cleared.",
+        feedback.source, feedback.message
+    )
 }
 
 struct RunExecLikeArgs {
@@ -410,6 +418,16 @@ impl ShellHandler {
         let dependency_env = session.dependency_env().await;
         if !dependency_env.is_empty() {
             exec_params.env.extend(dependency_env.clone());
+        }
+
+        if let Some(feedback) = session
+            .blocked_external_feedback_for_command(turn.as_ref(), &hook_command)
+            .await
+        {
+            return Ok(FunctionToolOutput::from_text(
+                external_feedback_shell_message(&feedback, &hook_command),
+                Some(false),
+            ));
         }
 
         let mut explicit_env_overrides = turn.shell_environment_policy.r#set.clone();

@@ -1,4 +1,7 @@
 use super::*;
+use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxWatcher;
+use crate::file_watcher::FileWatcher;
+use crate::file_watcher::WatchRegistration;
 
 /// Context for an initialized model agent
 ///
@@ -25,6 +28,7 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     pub(super) js_repl: Arc<JsReplHandle>,
     pub(super) next_internal_sub_id: AtomicU64,
+    pub(super) external_task_feedback_watch_registration: Mutex<Option<WatchRegistration>>,
 }
 
 #[derive(Clone)]
@@ -618,6 +622,13 @@ impl Session {
                 config.analytics_enabled,
             )
         });
+        let external_task_feedback_file_watcher = match FileWatcher::new() {
+            Ok(file_watcher) => Arc::new(file_watcher),
+            Err(err) => {
+                warn!("failed to initialize external task feedback watcher: {err}");
+                Arc::new(FileWatcher::noop())
+            }
+        };
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
@@ -657,6 +668,9 @@ impl Session {
             plugins_manager: Arc::clone(&plugins_manager),
             mcp_manager: Arc::clone(&mcp_manager),
             skills_watcher,
+            external_task_feedback_inbox_watcher: Arc::new(ExternalTaskFeedbackInboxWatcher::new(
+                &external_task_feedback_file_watcher,
+            )),
             agent_control,
             network_proxy,
             network_approval: Arc::clone(&network_approval),
@@ -707,6 +721,7 @@ impl Session {
             services,
             js_repl,
             next_internal_sub_id: AtomicU64::new(0),
+            external_task_feedback_watch_registration: Mutex::new(None),
         });
         if let Some(network_policy_decider_session) = network_policy_decider_session {
             let mut guard = network_policy_decider_session.write().await;
@@ -745,7 +760,9 @@ impl Session {
             sess.send_event_raw(event).await;
         }
 
+        sess.initialize_external_task_feedback_ipc().await;
         // Start the watcher after SessionConfigured so it cannot emit earlier events.
+        sess.start_external_task_feedback_inbox_listener();
         sess.start_skills_watcher_listener();
         sess.start_agent_identity_registration();
         let mut required_mcp_servers: Vec<String> = mcp_servers

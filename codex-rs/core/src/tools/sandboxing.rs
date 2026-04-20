@@ -329,6 +329,14 @@ pub(crate) trait ToolRuntime<Req, Out>: Approvable<Req> + Sandboxable {
         None
     }
 
+    async fn retry_blocked_by_external_feedback(
+        &self,
+        _req: &Req,
+        _ctx: &ToolCtx,
+    ) -> Option<ToolError> {
+        None
+    }
+
     async fn run(
         &mut self,
         req: &Req,

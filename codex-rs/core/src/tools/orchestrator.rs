@@ -237,6 +237,13 @@ impl ToolOrchestrator {
                 output,
                 network_policy_decision,
             }))) => {
+                let _ = tool_ctx
+                    .session
+                    .refresh_external_task_feedback_inbox()
+                    .await;
+                if let Some(err) = tool.retry_blocked_by_external_feedback(req, tool_ctx).await {
+                    return Err(err);
+                }
                 let network_approval_context = if managed_network_active {
                     network_policy_decision
                         .as_ref()
@@ -444,4 +451,330 @@ fn build_denial_reason_from_output(_output: &ExecToolCallOutput) -> String {
     // Keep approval reason terse and stable for UX/tests, but accept the
     // output so we can evolve heuristics later without touching call sites.
     "command failed; retry without sandbox?".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::external_task_feedback_inbox_watcher::ExternalTaskFeedbackInboxEnvelope;
+    use crate::external_task_feedback_inbox_watcher::external_task_feedback_inbox_dir;
+    use crate::session::tests::make_session_and_context_with_rx;
+    use crate::tools::sandboxing::Approvable;
+    use crate::tools::sandboxing::ApprovalCtx;
+    use crate::tools::sandboxing::PermissionRequestPayload;
+    use crate::tools::sandboxing::Sandboxable;
+    use codex_protocol::error::SandboxErr;
+    use codex_protocol::exec_output::ExecToolCallOutput;
+    use codex_protocol::exec_output::StreamOutput;
+    use codex_protocol::protocol::ExternalFeedbackDisposition;
+    use codex_protocol::protocol::ExternalFeedbackSeverity;
+    use codex_protocol::protocol::ExternalFeedbackSource;
+    use codex_protocol::protocol::ExternalTaskFeedback;
+    use codex_protocol::protocol::ExternalTaskFeedbackScope;
+    use codex_protocol::protocol::ReviewDecision;
+    use codex_sandboxing::SandboxablePreference;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use futures::future::BoxFuture;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    #[derive(Clone, Debug)]
+    struct FakeShellRequest {
+        hook_command: String,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeApplyPatchRequest {
+        file_paths: Vec<AbsolutePathBuf>,
+    }
+
+    #[derive(Default)]
+    struct FakeShellRuntime {
+        attempts: AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct FakeApplyPatchRuntime {
+        attempts: AtomicUsize,
+    }
+
+    impl Sandboxable for FakeShellRuntime {
+        fn sandbox_preference(&self) -> SandboxablePreference {
+            SandboxablePreference::Auto
+        }
+    }
+
+    impl Approvable<FakeShellRequest> for FakeShellRuntime {
+        type ApprovalKey = String;
+
+        fn approval_keys(&self, req: &FakeShellRequest) -> Vec<Self::ApprovalKey> {
+            vec![req.hook_command.clone()]
+        }
+
+        fn start_approval_async<'a>(
+            &'a mut self,
+            _req: &'a FakeShellRequest,
+            _ctx: ApprovalCtx<'a>,
+        ) -> BoxFuture<'a, ReviewDecision> {
+            Box::pin(async { ReviewDecision::Approved })
+        }
+
+        fn permission_request_payload(
+            &self,
+            req: &FakeShellRequest,
+        ) -> Option<PermissionRequestPayload> {
+            Some(PermissionRequestPayload {
+                tool_name: "Bash".to_string(),
+                command: req.hook_command.clone(),
+                description: None,
+            })
+        }
+    }
+
+    impl Sandboxable for FakeApplyPatchRuntime {
+        fn sandbox_preference(&self) -> SandboxablePreference {
+            SandboxablePreference::Auto
+        }
+    }
+
+    impl Approvable<FakeApplyPatchRequest> for FakeApplyPatchRuntime {
+        type ApprovalKey = AbsolutePathBuf;
+
+        fn approval_keys(&self, req: &FakeApplyPatchRequest) -> Vec<Self::ApprovalKey> {
+            req.file_paths.clone()
+        }
+
+        fn start_approval_async<'a>(
+            &'a mut self,
+            _req: &'a FakeApplyPatchRequest,
+            _ctx: ApprovalCtx<'a>,
+        ) -> BoxFuture<'a, ReviewDecision> {
+            Box::pin(async { ReviewDecision::Approved })
+        }
+    }
+
+    impl ToolRuntime<FakeShellRequest, String> for FakeShellRuntime {
+        async fn retry_blocked_by_external_feedback(
+            &self,
+            req: &FakeShellRequest,
+            ctx: &ToolCtx,
+        ) -> Option<ToolError> {
+            let feedback = ctx
+                .session
+                .blocked_external_feedback_for_command(ctx.turn.as_ref(), &req.hook_command)
+                .await?;
+            Some(ToolError::Rejected(format!(
+                "Command execution was blocked by {:?}: {}\nCommand: {}\nDo not retry this command until the external condition is cleared.",
+                feedback.source, feedback.message, req.hook_command
+            )))
+        }
+
+        async fn run(
+            &mut self,
+            _req: &FakeShellRequest,
+            attempt: &SandboxAttempt<'_>,
+            _ctx: &ToolCtx,
+        ) -> Result<String, ToolError> {
+            let attempt_number = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt_number == 0 && attempt.sandbox != SandboxType::None {
+                return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                    output: Box::new(ExecToolCallOutput {
+                        exit_code: 1,
+                        stdout: StreamOutput::new("".to_string()),
+                        stderr: StreamOutput::new("sandbox denied".to_string()),
+                        aggregated_output: StreamOutput::new("sandbox denied".to_string()),
+                        duration: std::time::Duration::from_millis(1),
+                        timed_out: false,
+                    }),
+                    network_policy_decision: None,
+                })));
+            }
+            Ok("unexpected retry".to_string())
+        }
+    }
+
+    impl ToolRuntime<FakeApplyPatchRequest, String> for FakeApplyPatchRuntime {
+        async fn retry_blocked_by_external_feedback(
+            &self,
+            req: &FakeApplyPatchRequest,
+            ctx: &ToolCtx,
+        ) -> Option<ToolError> {
+            let feedback = ctx
+                .session
+                .blocked_external_feedback_for_paths(ctx.turn.as_ref(), &req.file_paths)
+                .await?;
+            let touched_paths = req
+                .file_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(ToolError::Rejected(format!(
+                "Patch application was blocked by {:?}: {}\nPaths: {touched_paths}\nDo not retry this patch until the external condition is cleared.",
+                feedback.source, feedback.message
+            )))
+        }
+
+        async fn run(
+            &mut self,
+            _req: &FakeApplyPatchRequest,
+            attempt: &SandboxAttempt<'_>,
+            _ctx: &ToolCtx,
+        ) -> Result<String, ToolError> {
+            let attempt_number = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt_number == 0 && attempt.sandbox != SandboxType::None {
+                return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+                    output: Box::new(ExecToolCallOutput {
+                        exit_code: 1,
+                        stdout: StreamOutput::new("".to_string()),
+                        stderr: StreamOutput::new("sandbox denied".to_string()),
+                        aggregated_output: StreamOutput::new("sandbox denied".to_string()),
+                        duration: std::time::Duration::from_millis(1),
+                        timed_out: false,
+                    }),
+                    network_policy_decision: None,
+                })));
+            }
+            Ok("unexpected retry".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn orchestrator_skips_retry_when_external_feedback_blocks_command() {
+        let (session, turn, _rx_event) = make_session_and_context_with_rx().await;
+        let feedback = ExternalTaskFeedback {
+            source: ExternalFeedbackSource::SecuritySoftware,
+            severity: ExternalFeedbackSeverity::Error,
+            disposition: ExternalFeedbackDisposition::DoNotRetry,
+            scope: ExternalTaskFeedbackScope::Command {
+                turn_id: Some(turn.sub_id.clone()),
+                command: "git status".to_string(),
+            },
+            message: "endpoint protection denied execution".to_string(),
+            observed_at: None,
+        };
+        let inbox_dir = external_task_feedback_inbox_dir(&session.codex_home().await);
+        tokio::fs::create_dir_all(&inbox_dir)
+            .await
+            .expect("create inbox dir");
+        let inbox_path = inbox_dir.join(format!("{}.command.json", session.conversation_id));
+        tokio::fs::write(
+            &inbox_path,
+            serde_json::to_vec(&ExternalTaskFeedbackInboxEnvelope {
+                version: 1,
+                thread_id: session.conversation_id,
+                feedback,
+            })
+            .expect("serialize feedback envelope"),
+        )
+        .await
+        .expect("write feedback inbox file");
+
+        let mut runtime = FakeShellRuntime::default();
+        let mut orchestrator = ToolOrchestrator::new();
+        let tool_ctx = ToolCtx {
+            session: session,
+            turn: turn,
+            call_id: "call-1".to_string(),
+            tool_name: "shell".to_string(),
+        };
+        let request = FakeShellRequest {
+            hook_command: "git status".to_string(),
+        };
+
+        let result = orchestrator
+            .run(
+                &mut runtime,
+                &request,
+                &tool_ctx,
+                tool_ctx.turn.as_ref(),
+                AskForApproval::OnFailure,
+            )
+            .await;
+
+        match result {
+            Err(ToolError::Rejected(message)) => {
+                assert!(message.contains("Do not retry this command"));
+            }
+            Ok(_) => panic!("expected rejected retry block, got successful retry result"),
+            Err(other) => panic!("expected rejected retry block, got {other:?}"),
+        }
+        assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::fs::metadata(&inbox_path).await.is_err(),
+            "feedback inbox file should be removed after refresh + ingest"
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_skips_retry_when_external_feedback_blocks_path() {
+        let (session, turn, _rx_event) = make_session_and_context_with_rx().await;
+        let blocked_path = AbsolutePathBuf::resolve_path_against_base(
+            PathBuf::from("README.md").as_path(),
+            &turn.cwd,
+        );
+        let feedback = ExternalTaskFeedback {
+            source: ExternalFeedbackSource::OperatingSystem,
+            severity: ExternalFeedbackSeverity::Error,
+            disposition: ExternalFeedbackDisposition::DoNotRetry,
+            scope: ExternalTaskFeedbackScope::Path {
+                turn_id: Some(turn.sub_id.clone()),
+                path: PathBuf::from("README.md"),
+            },
+            message: "file is locked by another process".to_string(),
+            observed_at: None,
+        };
+        let inbox_dir = external_task_feedback_inbox_dir(&session.codex_home().await);
+        tokio::fs::create_dir_all(&inbox_dir)
+            .await
+            .expect("create inbox dir");
+        let inbox_path = inbox_dir.join(format!("{}.path.json", session.conversation_id));
+        tokio::fs::write(
+            &inbox_path,
+            serde_json::to_vec(&ExternalTaskFeedbackInboxEnvelope {
+                version: 1,
+                thread_id: session.conversation_id,
+                feedback,
+            })
+            .expect("serialize feedback envelope"),
+        )
+        .await
+        .expect("write feedback inbox file");
+
+        let mut runtime = FakeApplyPatchRuntime::default();
+        let mut orchestrator = ToolOrchestrator::new();
+        let tool_ctx = ToolCtx {
+            session: session,
+            turn: turn,
+            call_id: "call-path".to_string(),
+            tool_name: "apply_patch".to_string(),
+        };
+        let request = FakeApplyPatchRequest {
+            file_paths: vec![blocked_path],
+        };
+
+        let result = orchestrator
+            .run(
+                &mut runtime,
+                &request,
+                &tool_ctx,
+                tool_ctx.turn.as_ref(),
+                AskForApproval::OnFailure,
+            )
+            .await;
+
+        match result {
+            Err(ToolError::Rejected(message)) => {
+                assert!(message.contains("Do not retry this patch"));
+            }
+            Ok(_) => panic!("expected rejected retry block, got successful retry result"),
+            Err(other) => panic!("expected rejected retry block, got {other:?}"),
+        }
+        assert_eq!(runtime.attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::fs::metadata(&inbox_path).await.is_err(),
+            "feedback inbox file should be removed after refresh + ingest"
+        );
+    }
 }

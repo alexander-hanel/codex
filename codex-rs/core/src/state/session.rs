@@ -11,6 +11,7 @@ use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use codex_protocol::protocol::ExternalTaskFeedback;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -36,6 +37,7 @@ pub(crate) struct SessionState {
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
     granted_permissions: Option<PermissionProfile>,
     next_turn_is_first: bool,
+    external_task_feedback: Vec<ExternalTaskFeedback>,
 }
 
 impl SessionState {
@@ -56,6 +58,7 @@ impl SessionState {
             pending_session_start_source: None,
             granted_permissions: None,
             next_turn_is_first: true,
+            external_task_feedback: Vec::new(),
         }
     }
 
@@ -218,6 +221,14 @@ impl SessionState {
     // Removes all currently tracked connector selections.
     pub(crate) fn clear_connector_selection(&mut self) {
         self.active_connector_selection.clear();
+    }
+
+    pub(crate) fn record_external_task_feedback(&mut self, feedback: ExternalTaskFeedback) {
+        self.external_task_feedback.push(feedback);
+    }
+
+    pub(crate) fn external_task_feedback(&self) -> &[ExternalTaskFeedback] {
+        &self.external_task_feedback
     }
 
     pub(crate) fn set_pending_session_start_source(

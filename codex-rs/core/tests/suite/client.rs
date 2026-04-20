@@ -38,6 +38,11 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ExternalFeedbackDisposition;
+use codex_protocol::protocol::ExternalFeedbackSeverity;
+use codex_protocol::protocol::ExternalFeedbackSource;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackScope;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -2116,6 +2121,107 @@ async fn includes_developer_instructions_message_in_request() {
             .any(|text| text.starts_with("<environment_context>")
                 && text.ends_with("</environment_context>")),
         "expected environment context in contextual user message, got {user_context_texts:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_task_feedback_is_included_in_next_model_request() {
+    skip_if_no_network!();
+    let server = MockServer::start().await;
+
+    let first_turn = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let second_turn = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp2"), ev_completed("resp2")]),
+    )
+    .await;
+
+    let TestCodex { codex, .. } = test_codex()
+        .with_auth(CodexAuth::from_api_key("Test API Key"))
+        .build(&server)
+        .await
+        .expect("create new conversation");
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await
+        .expect("submit initial turn");
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    let _ = first_turn.single_request();
+
+    codex
+        .submit(Op::ExternalTaskFeedback {
+            feedback: ExternalTaskFeedback {
+                source: ExternalFeedbackSource::SecuritySoftware,
+                severity: ExternalFeedbackSeverity::Error,
+                disposition: ExternalFeedbackDisposition::DoNotRetry,
+                scope: ExternalTaskFeedbackScope::Command {
+                    turn_id: None,
+                    command: "git status".to_string(),
+                },
+                message: "endpoint protection blocked process creation".to_string(),
+                observed_at: Some(1_712_345_680),
+            },
+        })
+        .await
+        .expect("submit external task feedback");
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::ExternalTaskFeedback(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "second turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+        })
+        .await
+        .expect("submit second turn");
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let request = second_turn.single_request();
+    assert!(
+        message_input_text_contains(
+            &request,
+            "developer",
+            "External task feedback received from a secondary process."
+        ),
+        "expected model request to include injected external feedback developer message, got {:?}",
+        request.body_json()["input"]
+    );
+    assert!(
+        message_input_text_contains(&request, "developer", "Source: security_software"),
+        "expected model request to include external feedback source, got {:?}",
+        request.body_json()["input"]
+    );
+    assert!(
+        message_input_text_contains(&request, "developer", "Scope: command `git status`"),
+        "expected model request to include external feedback scope, got {:?}",
+        request.body_json()["input"]
+    );
+    assert!(
+        message_input_text_contains(
+            &request,
+            "developer",
+            "Message: endpoint protection blocked process creation"
+        ),
+        "expected model request to include external feedback message, got {:?}",
+        request.body_json()["input"]
     );
 }
 

@@ -2,6 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_protocol::models::ShellCommandToolCallParams;
+use codex_protocol::protocol::ExternalFeedbackDisposition;
+use codex_protocol::protocol::ExternalFeedbackSeverity;
+use codex_protocol::protocol::ExternalFeedbackSource;
+use codex_protocol::protocol::ExternalTaskFeedback;
+use codex_protocol::protocol::ExternalTaskFeedbackScope;
 use core_test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -282,4 +287,47 @@ fn build_post_tool_use_payload_uses_tool_output_wire_value() {
             tool_response: json!("shell output"),
         })
     );
+}
+
+#[tokio::test]
+async fn shell_handler_short_circuits_blocked_command_feedback() {
+    let (session, turn) = make_session_and_context().await;
+    session
+        .record_external_task_feedback(ExternalTaskFeedback {
+            source: ExternalFeedbackSource::SecuritySoftware,
+            severity: ExternalFeedbackSeverity::Error,
+            disposition: ExternalFeedbackDisposition::DoNotRetry,
+            scope: ExternalTaskFeedbackScope::Command {
+                turn_id: Some(turn.sub_id.clone()),
+                command: "echo blocked".to_string(),
+            },
+            message: "process creation was denied".to_string(),
+            observed_at: None,
+        })
+        .await;
+
+    let output = ShellHandler
+        .handle(ToolInvocation {
+            session: session.into(),
+            turn: turn.into(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-blocked".to_string(),
+            tool_name: codex_tools::ToolName::plain("shell"),
+            payload: ToolPayload::LocalShell {
+                params: codex_protocol::models::ShellToolCallParams {
+                    command: vec!["echo".to_string(), "blocked".to_string()],
+                    workdir: None,
+                    timeout_ms: None,
+                    sandbox_permissions: None,
+                    prefix_rule: None,
+                    additional_permissions: None,
+                    justification: None,
+                },
+            },
+        })
+        .await
+        .expect("shell handler should return a model-visible failure");
+
+    assert_eq!(output.success, Some(false));
+    assert!(output.into_text().contains("Do not retry this command"));
 }
