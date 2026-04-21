@@ -1,25 +1,64 @@
-# IPC Feedback Bridge
+# IPC Feedback Bridge for Codex
 
-This document describes the IPC feedback bridge added to Codex so a secondary
-local process can communicate structured runtime feedback about the current
-task.
+This repository is a fork of OpenAI's Codex with an added IPC feedback bridge.
 
-The main purpose is to give Codex better context when a tool call fails for a
-reason that Codex cannot reliably infer on its own, such as an external block,
-policy denial, file lock, or operating-system restriction.
+The goal of the bridge is simple: let a second local process tell Codex
+something important about the current task, especially when Codex cannot infer
+the reason for a failure by itself.
 
 Typical examples:
 
 - a security product blocked a command
-- a filesystem monitor denied access to a path
-- an orchestration layer cancelled or replaced work
+- a file is locked by another process
+- the operating system denied access to a path
 - an external supervisor knows a retry should not happen
+- a secondary process wants to add task-wide context before the next turn
+
+The key outcome is that Codex can use this feedback as model-visible context and
+can also change retry behavior for some tool calls.
+
+## What This Adds
+
+This fork adds two connected pieces:
+
+1. A typed internal feedback path inside Codex.
+2. A local file-based IPC surface that outside processes can write to.
+
+Once feedback is ingested, Codex can:
+
+- record it in session state
+- expose it as an `ExternalTaskFeedback` event
+- include it in model-visible context
+- stop retrying some blocked shell and `apply_patch` actions
+
+Today, the behavior-changing part is implemented for:
+
+- shell commands blocked by matching command feedback
+- `apply_patch` blocked by matching path feedback
+
+## When To Use It
+
+Use this bridge when an external process knows something Codex should take into
+account, such as:
+
+- "this command was blocked by endpoint protection"
+- "this file is locked"
+- "do not keep retrying this action"
+- "the whole task is under external policy monitoring"
+
+If your goal is broad steering rather than blocking one exact command, prefer
+`session` scope.
+
+If your goal is to stop retries for one exact shell command, use `command`
+scope.
+
+If your goal is to stop retries for edits to one file, use `path` scope.
 
 ## Quick Start
 
-Smallest live demo:
+### Smallest live demo
 
-1. Start Codex in one terminal.
+Start Codex in one terminal:
 
 ```bash
 cd /home/USER/repos/codex/codex-rs
@@ -27,13 +66,13 @@ unset CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED
 CODEX_SKIP_VENDORED_BWRAP=1 ./target/debug/codex
 ```
 
-2. In Codex, type:
+In Codex, type:
 
 ```text
 Say hello, then wait for my next instruction.
 ```
 
-3. From a second terminal, send session-scoped feedback:
+From a second terminal, send session-scoped feedback:
 
 ```bash
 cd /home/USER/repos/codex
@@ -46,7 +85,7 @@ python3 codex-rs/scripts/send_external_task_feedback.py \
   --message "A secondary process reports that this task is under external monitoring. Avoid repeated retries until the condition is clarified."
 ```
 
-4. Back in Codex, type:
+Back in Codex, type:
 
 ```text
 Continue, but account for any external feedback you have received.
@@ -57,7 +96,7 @@ Expected result:
 - Codex ingests the feedback
 - the next turn sees it as developer-visible context
 
-Smallest automated check:
+### Smallest automated check
 
 ```bash
 cd /home/USER/repos/codex/codex-rs
@@ -65,25 +104,13 @@ unset CODEX_SANDBOX CODEX_SANDBOX_NETWORK_DISABLED
 CODEX_SKIP_VENDORED_BWRAP=1 cargo test -p codex-core external_task_feedback_is_included_in_next_model_request -- --nocapture
 ```
 
-## Executive Summary
+## Mental Model
 
-The implementation now has two connected layers:
+The bridge has two layers.
 
-1. Codex has a typed internal feedback path for external task signals.
-2. Codex publishes a local file-based IPC surface so secondary processes can
-   discover active sessions and submit that feedback.
+### Layer 1: internal feedback types
 
-Once feedback is ingested, Codex can change behavior instead of only logging a
-diagnostic. The currently implemented behavior is:
-
-- shell execution can short-circuit retries for blocked commands
-- `apply_patch` can short-circuit retries for blocked paths
-
-## What Was Added
-
-### Typed feedback inside Codex
-
-Core protocol types:
+Codex has typed feedback objects such as:
 
 - `ExternalFeedbackSource`
 - `ExternalFeedbackSeverity`
@@ -92,44 +119,24 @@ Core protocol types:
 - `ExternalTaskFeedback`
 - `ExternalTaskFeedbackEvent`
 
-Core behavior:
+These let Codex treat outside feedback as first-class runtime information
+instead of only plain text.
 
-- feedback can be submitted as `Op::ExternalTaskFeedback`
-- feedback is recorded in session state
-- feedback is emitted as `EventMsg::ExternalTaskFeedback`
-- shell calls can short-circuit when a matching blocked command was reported
-- `apply_patch` can short-circuit when a matching blocked path was reported
+### Layer 2: local IPC transport
 
-### File-based IPC for external processes
+Codex also publishes a file-based interface under `CODEX_HOME` so an outside
+process can:
 
-Codex now publishes session registration metadata and watches a shared inbox for
-external feedback files.
+- discover active sessions
+- choose a target thread
+- write a feedback envelope into the shared inbox
 
-This transport is intentionally file-based because it works on Windows, Linux,
-and macOS without adding platform-specific IPC plumbing.
-
-## Files Involved
-
-Primary implementation files:
-
-- `codex-rs/core/src/external_task_feedback_inbox_watcher.rs`
-- `codex-rs/core/src/session/session.rs`
-- `codex-rs/core/src/session/mod.rs`
-- `codex-rs/core/src/session/handlers.rs`
-- `codex-rs/core/src/state/session.rs`
-- `codex-rs/core/src/tools/handlers/shell.rs`
-- `codex-rs/core/src/tools/handlers/apply_patch.rs`
-- `codex-rs/protocol/src/protocol.rs`
-- `codex-rs/core/src/state/service.rs`
-
-Companion utility and tests:
-
-- `codex-rs/scripts/send_external_task_feedback.py`
-- `codex-rs/scripts/test_send_external_task_feedback.py`
+That transport is file-based on purpose. It works on Windows, Linux, and macOS
+without introducing sockets, named pipes, or platform-specific services.
 
 ## How It Works
 
-Codex exposes two IPC surfaces under `CODEX_HOME`.
+Codex exposes two IPC directories under `CODEX_HOME`:
 
 ```text
 CODEX_HOME/
@@ -157,25 +164,23 @@ That file includes:
 - `inbox_path`
 - `created_at`
 
-This solves the discovery problem for a secondary process. It does not need an
-out-of-band channel to learn the active `thread_id`; it can read the session
-registry directly.
+This solves the discovery problem for a second process. It does not need an
+out-of-band channel to learn the active thread id.
 
 ### Feedback delivery
 
-The secondary process writes a JSON envelope into:
+The second process writes a JSON envelope into:
 
 ```text
 CODEX_HOME/ipc/external-task-feedback/inbox/
 ```
 
-Codex watches that directory, filters files that match the current thread, reads
-the envelope, routes the feedback through the internal handler, and deletes the
-file after successful ingestion.
+Codex watches that inbox, reads matching files, validates the payload, ingests
+the feedback, and deletes the file after successful processing.
 
-## Envelope Contract
+## Feedback Shape
 
-### Envelope shape
+Example envelope:
 
 ```json
 {
@@ -195,7 +200,7 @@ file after successful ingestion.
 }
 ```
 
-### Supported scope types
+Supported scope values:
 
 - `session`
 - `turn`
@@ -203,7 +208,7 @@ file after successful ingestion.
 - `command`
 - `path`
 
-### Supported source values
+Supported source values:
 
 - `external_process`
 - `security_software`
@@ -211,143 +216,104 @@ file after successful ingestion.
 - `user`
 - `other`
 
-### Supported severity values
+Supported severity values:
 
 - `info`
 - `warning`
 - `error`
 
-### Supported disposition values
+Supported disposition values:
 
 - `informational`
 - `failed_by_external_actor`
 - `do_not_retry`
 
-## IPC Flow
+## What Codex Actually Does With Feedback
 
-```mermaid
-sequenceDiagram
-    participant Secondary as Secondary Process
-    participant Registry as ipc/sessions/<thread_id>.json
-    participant Inbox as ipc/external-task-feedback/inbox
-    participant Watcher as ExternalTaskFeedbackInboxWatcher
-    participant Session as core::session
-    participant ToolState as tool handlers / session state
+Once feedback is ingested, Codex routes it through the same internal path as
+direct runtime feedback.
 
-    Secondary->>Registry: read session registration
-    Registry-->>Secondary: thread_id + inbox_path
-    Secondary->>Inbox: atomic write <thread_id>.<scope>.<nonce>.json
-    Watcher-->>Session: InboxChanged(paths)
-    Session->>Session: read + validate envelope
-    Session->>ToolState: Op::ExternalTaskFeedback equivalent handling
-    ToolState-->>Session: remember blocked command/path
-    Session->>Inbox: delete processed file
+That means it can:
+
+- record the feedback in session state
+- emit `ExternalTaskFeedback` events
+- make the feedback visible to the model
+- consult the feedback before retrying some tool actions
+
+There are two important runtime cases:
+
+### Active turn
+
+If Codex is already in an active turn, the feedback is injected so the current
+turn can see it on the next actionable step.
+
+### Idle session
+
+If Codex is idle, the feedback is recorded into conversation history so it is
+present on the next model request.
+
+This matters because it means feedback does not have to arrive before Codex
+starts up. It only has to arrive before the next decision point where it should
+matter.
+
+## Exact vs Broad Matching
+
+This is one of the most important things to understand.
+
+### `session` scope
+
+Use this when you want to steer the whole task or next turn, even if no command
+has run yet.
+
+This is the best choice for messages like:
+
+- "the task is under external monitoring"
+- "repeated failures may be caused by outside enforcement"
+- "avoid retries until the condition is clarified"
+
+### `command` scope
+
+Use this when you want to block retries for a specific shell command.
+
+Current limitation:
+
+- command matching is exact string matching
+
+So feedback for:
+
+```text
+git status
 ```
 
-## How Codex Acts On Feedback
+does not automatically match:
 
-Once ingested, feedback is routed through the same typed path as direct internal
-task feedback:
+```text
+git status --short --branch
+```
 
-- `handlers::external_task_feedback(...)` records it in session state
-- `EventMsg::ExternalTaskFeedback(...)` is emitted to clients
-- shell execution checks for matching blocked commands and short-circuits retries
-- `apply_patch` checks for matching blocked paths and short-circuits retries
+If you want a reliable command demo today, send feedback for the exact command
+string Codex is expected to run.
 
-This is the part that changes Codex behavior instead of only logging a
-diagnostic.
+### `path` scope
 
-## Interaction With The Normal Model Loop
+Use this when the outside condition applies to a file or path, such as a lock or
+access restriction.
 
-The external feedback IPC path does not replace the main model request/response
-pipeline. It inserts structured runtime feedback into the same session state the
-turn loop already consults.
+## Helper Script
 
-Relevant surrounding files in the normal model flow:
-
-### Transport and provider interaction
-
-- `codex-rs/core/src/client.rs`
-- `codex-rs/codex-api/src/endpoint/responses.rs`
-
-### Stream processing
-
-- `codex-rs/core/src/session/turn.rs`
-- `codex-rs/core/src/stream_events_utils.rs`
-
-### Tool execution
-
-- `codex-rs/core/src/tools/router.rs`
-- `codex-rs/core/src/tools/parallel.rs`
-- `codex-rs/core/src/tools/orchestrator.rs`
-- `codex-rs/core/src/tools/registry.rs`
-
-The practical effect is:
-
-1. the model asks Codex to do something
-2. Codex executes the tool
-3. a secondary process can report that a command or path was blocked
-4. Codex records that feedback
-5. later tool attempts can short-circuit instead of blindly retrying
-
-## Local Companion Utility
-
-For local testing, use:
+The local helper for testing and external integration is:
 
 - `codex-rs/scripts/send_external_task_feedback.py`
 
-Examples:
+Common commands:
+
+List discovered sessions:
 
 ```bash
 python3 codex-rs/scripts/send_external_task_feedback.py --list-sessions
 ```
 
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --discover-first \
-  --source external_process \
-  --severity warning \
-  --disposition informational \
-  --message "A secondary process reports that this task is under external monitoring. Avoid repeated retries until the condition is clarified." \
-  --scope-type session
-```
-
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --discover-first \
-  --source security_software \
-  --severity error \
-  --disposition do_not_retry \
-  --message "Command blocked by endpoint security" \
-  --scope-type command \
-  --command "git status"
-```
-
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --thread-id <thread_id> \
-  --source security_software \
-  --severity error \
-  --disposition do_not_retry \
-  --message "Access denied by policy" \
-  --scope-type path \
-  --path /path/to/file
-```
-
-## Example Prompts
-
-### Session-scoped feedback test case
-
-Use the following prompt in a local Codex session:
-
-```text
-Continue, but account for any external feedback you have received.
-```
-
-This is the simplest way to verify that a secondary process can influence the
-model even when no command has been executed yet.
-
-Inject this feedback from another terminal:
+Send session-scoped feedback:
 
 ```bash
 python3 codex-rs/scripts/send_external_task_feedback.py \
@@ -359,160 +325,81 @@ python3 codex-rs/scripts/send_external_task_feedback.py \
   --message "A secondary process reports that this task is under external monitoring. Avoid repeated retries until the condition is clarified."
 ```
 
-Expected result:
+Send exact command feedback:
 
-- Codex ingests the feedback as model-visible developer context
-- the next turn reflects that constraint in its reasoning
+```bash
+python3 codex-rs/scripts/send_external_task_feedback.py \
+  --discover-first \
+  --source security_software \
+  --severity error \
+  --disposition do_not_retry \
+  --scope-type command \
+  --command "git status --short --branch" \
+  --message "git status --short --branch was blocked by endpoint protection"
+```
 
-### Command blocked test case
+Send path-scoped feedback:
 
-Use the following prompt in a local Codex session:
+```bash
+python3 codex-rs/scripts/send_external_task_feedback.py \
+  --thread-id <thread_id> \
+  --source operating_system \
+  --severity error \
+  --disposition do_not_retry \
+  --scope-type path \
+  --path /path/to/file \
+  --message "Access denied by policy"
+```
+
+## Suggested Demo Prompts
+
+### Broad session feedback
+
+In Codex:
+
+```text
+Continue, but account for any external feedback you have received.
+```
+
+This is the simplest prompt for proving that a second process can influence
+Codex even when no command has run.
+
+### Exact command feedback
+
+In Codex:
 
 ```text
 Run exactly this command and nothing else: `git status --short --branch`
 ```
 
-This prompt is intentionally strict because command-scoped feedback currently
-matches the command string exactly.
+Use this when you want to demonstrate command blocking with the current exact
+matching behavior.
 
-### Blocked-path `apply_patch` test case
+### Blocked path for `apply_patch`
 
-Use the following prompt to exercise the blocked-path edit flow:
-
-```text
-I want to test external task feedback handling for file access problems.
-
-Please make a small edit to `README.md` by adding a short temporary line near
-the end of the file. If the edit succeeds, tell me what changed. If it fails,
-explain the failure briefly and decide whether to try again based on any
-structured external feedback you receive.
-
-Important behavior for this test:
-- If an external process reports that `README.md` is blocked or cannot be
-  accessed, do not keep retrying the patch.
-- Instead, acknowledge that the file was blocked by an external actor and move
-  on to the next best non-blocked step.
-- If there is no external feedback, treat it like a normal patch failure and use
-  your default behavior.
-```
-
-This prompt gives Codex a concrete file mutation target and lets you verify that
-path-scoped feedback changes retry behavior for `apply_patch`.
-
-## Local Test Walkthrough
-
-### 1. Start Codex locally
-
-Start a normal local Codex session in this repository.
-
-Once the session is running, list discovered sessions:
-
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py --list-sessions
-```
-
-You should see one or more registration objects with a `thread_id`.
-
-### 2. Minimal live session-scoped demo
-
-Paste this into the running Codex session:
+In Codex:
 
 ```text
-Say hello, then wait for my next instruction.
+Please make a small edit to `README.md`. If the file is blocked, do not keep retrying.
 ```
 
-Then inject session-wide feedback from another terminal:
+Use this when you want to demonstrate path-scoped external feedback affecting
+edit retries.
 
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --discover-first \
-  --source external_process \
-  --severity warning \
-  --disposition informational \
-  --scope-type session \
-  --message "A secondary process reports that this task is under external monitoring. Avoid repeated retries until the condition is clarified."
-```
-
-Expected result:
-
-- the helper writes an inbox file for the active thread
-- Codex ingests the file
-- the next model turn includes the feedback as developer-visible context
-
-Now send this follow-up prompt in Codex:
-
-```text
-Continue, but account for any external feedback you have received.
-```
-
-### 3. Exact command-match demo
-
-Paste the command test prompt from the previous section into the running Codex
-session.
-
-Then inject matching command feedback from another terminal:
-
-```bash
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --discover-first \
-  --source security_software \
-  --severity error \
-  --disposition do_not_retry \
-  --message "git status --short --branch was blocked by endpoint protection" \
-  --scope-type command \
-  --command "git status --short --branch"
-```
-
-Expected result:
-
-- the helper writes an inbox file for the active thread
-- Codex ingests the file
-- the shell handler recognizes the command as blocked
-- Codex stops retrying that exact command
-
-### 4. Paste the blocked-path prompt
-
-Paste the blocked-path prompt into the running Codex session.
-
-### 5. Inject path feedback from another terminal
-
-```bash
-cd /path/to/your/codex/repo
-python3 codex-rs/scripts/send_external_task_feedback.py \
-  --discover-first \
-  --source operating_system \
-  --severity error \
-  --disposition do_not_retry \
-  --message "README.md is locked by another process" \
-  --scope-type path \
-  --path "$(pwd)/README.md"
-```
-
-Expected result:
-
-- the helper writes a path-scoped inbox file for the active thread
-- Codex ingests the file
-- the `apply_patch` handler recognizes the path as blocked
-- Codex stops retrying edits against that file
-
-## Test Coverage
+## Testing
 
 ### Python helper tests
-
-Run:
 
 ```bash
 python3 -m unittest codex-rs/scripts/test_send_external_task_feedback.py
 ```
 
-Coverage:
+What this covers:
 
-- session registrations can be listed
-- a feedback envelope is written for a discovered session
+- session registration discovery
+- feedback envelope creation
 
-### Rust feedback tests
-
-Run:
+### Core feedback tests
 
 ```bash
 cd codex-rs
@@ -520,18 +407,16 @@ CODEX_SKIP_VENDORED_BWRAP=1 cargo test -p codex-core external_task_feedback -- -
 CODEX_SKIP_VENDORED_BWRAP=1 cargo test -p codex-core external_task_feedback_is_included_in_next_model_request -- --nocapture
 ```
 
-Coverage:
+What this covers:
 
-- inbox watcher forwards file events
-- session registration file is written
-- inbox files are ingested
-- external feedback is recorded and emitted
-- active-turn feedback is injected into model-visible input
-- idle feedback is recorded so it appears on the next model request
+- inbox watcher behavior
+- session registration creation and cleanup
+- inbox ingestion
+- event emission
+- active-turn model-visible injection
+- idle-session model-visible injection into the next request
 
-### Rust behavior tests
-
-Run:
+### Retry-behavior tests
 
 ```bash
 cd codex-rs
@@ -539,133 +424,65 @@ CODEX_SKIP_VENDORED_BWRAP=1 cargo test -p codex-core shell_handler_short_circuit
 CODEX_SKIP_VENDORED_BWRAP=1 cargo test -p codex-core apply_patch_handler_short_circuits_blocked_path_feedback -- --nocapture
 ```
 
-Coverage:
+What this covers:
 
-- shell does not keep retrying a command that was externally marked blocked
-- `apply_patch` does not keep retrying a path that was externally marked blocked
+- shell stops retrying a blocked command
+- `apply_patch` stops retrying a blocked path
 
+## Important Limitations
 
-## Why This IPC Shape Fits
+- the transport is local file-based only
+- `--discover-first` is convenient for local testing but weak for automation in
+  multi-session setups
+- retry short-circuiting is currently implemented for shell command and path
+  cases, not every possible tool or failure mode
+- command matching is currently exact string matching
+- session-scoped feedback is the best current option when no command has run yet
+- feedback affects the next actionable decision point, not an already-streaming
+  model generation token-by-token
 
-This approach is intentionally simple:
+## Why This Design Was Chosen
+
+This IPC shape is intentionally simple:
 
 - cross-platform
-- no sockets or named pipes to secure and debug
-- easy to inspect manually during development
-- easy for external processes written in any language
-- durable enough for short-lived agent or security events
+- easy to inspect manually
+- easy to write from any language
+- durable enough for short-lived local coordination
 
-If this grows further, the same registry-plus-inbox contract can later be
-wrapped by:
+If this evolves later, the same registry-plus-inbox contract could be wrapped by:
 
 - a local service
 - named pipes
 - OS-native notifications
-- an app-server RPC endpoint
+- an app-server RPC layer
 
 without changing the core feedback semantics.
 
-## Minimal Debugging Path
+## Implementation Map
 
-If you want to step through the broader model interaction around this feature,
-this is the shortest useful chain:
+Primary implementation files:
+
+- `codex-rs/core/src/external_task_feedback_inbox_watcher.rs`
+- `codex-rs/core/src/session/session.rs`
+- `codex-rs/core/src/session/mod.rs`
+- `codex-rs/core/src/session/handlers.rs`
+- `codex-rs/core/src/state/session.rs`
+- `codex-rs/core/src/tools/handlers/shell.rs`
+- `codex-rs/core/src/tools/handlers/apply_patch.rs`
+- `codex-rs/core/src/tools/orchestrator.rs`
+- `codex-rs/protocol/src/protocol.rs`
+
+If you want to trace the broader model loop around this feature, this is the
+shortest useful chain:
 
 1. `tui/src/chatwidget.rs` or `app-server/src/codex_message_processor.rs`
 2. `core/src/tasks/regular.rs`
 3. `core/src/session/turn.rs::run_turn`
-4. `core/src/session/turn.rs::build_prompt`
-5. `core/src/client.rs::ModelClientSession::build_responses_request`
-6. `core/src/client.rs::ModelClientSession::stream`
-7. `codex-api/src/endpoint/responses.rs::stream_request`
-8. `core/src/session/turn.rs` streamed `ResponseEvent` match
-9. `core/src/stream_events_utils.rs::handle_output_item_done`
-10. `core/src/tools/router.rs::build_tool_call`
-11. `core/src/tools/parallel.rs::handle_tool_call`
-12. feedback ingestion in `core/src/session/mod.rs`
-13. next iteration of `run_turn`
-
-## Current Limitations
-
-- the IPC transport is local file-based only
-- `--discover-first` is fine for local testing but not ideal for multi-session
-  routing in production
-- the current short-circuit behavior is implemented for command and path retry
-  prevention, not for every tool or failure mode
-- command-scoped matching is currently exact string matching
-- session-scoped feedback is the best current choice when no command has run yet
-
-## Recommended Next Steps
-
-- expose external feedback events in the TUI or app-server UI
-- add stronger multi-session targeting rules for automation
-- add more behavior hooks for other tool types
-- optionally add a higher-level local service on top of the same registry and
-  inbox contract
-
-
-## Quiz
-
-A local quiz generator is also included to help verify that someone understands
-the high-level architecture described in `docs/model-interaction-report.md`.
-
-Script:
-
-- `codex-rs/scripts/model_interaction_quiz.py`
-
-What it does:
-
-- generates a multiple-choice quiz from the model interaction report
-- includes at least 15 questions by default
-- randomizes question order and answer order
-- supports `--seed` for deterministic quiz generation
-- supports `--interactive` for one-question-at-a-time terminal use
-- supports `--show-answers` and `--markdown`
-
-### Run the quiz
-
-From the repo root:
-
-```bash
-python3 codex-rs/scripts/model_interaction_quiz.py
-```
-
-### Run the quiz interactively
-
-```bash
-python3 codex-rs/scripts/model_interaction_quiz.py --interactive
-```
-
-### Run the quiz with a fixed seed
-
-```bash
-python3 codex-rs/scripts/model_interaction_quiz.py --seed 7
-```
-
-### Show the answer key
-
-```bash
-python3 codex-rs/scripts/model_interaction_quiz.py --show-answers
-```
-
-### Generate markdown output
-
-```bash
-python3 codex-rs/scripts/model_interaction_quiz.py --markdown --show-answers > model-interaction-quiz.md
-```
-
-### Run the quiz tests
-
-```bash
-python3 -m unittest codex-rs/scripts/test_model_interaction_quiz.py
-```
-
-
-
-```
-is it updated?
-
-
-• No. README.md was not updated.
-
-  The edit attempt on README.md was blocked by an external security control, and the runtime indicated not to retry until that condition is cleared.
-```
+4. `core/src/client.rs::ModelClientSession::build_responses_request`
+5. `codex-api/src/endpoint/responses.rs::stream_request`
+6. `core/src/stream_events_utils.rs::handle_output_item_done`
+7. `core/src/tools/router.rs::build_tool_call`
+8. `core/src/tools/parallel.rs::handle_tool_call`
+9. feedback ingestion in `core/src/session/mod.rs`
+10. next iteration of `run_turn`

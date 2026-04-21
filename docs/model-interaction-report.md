@@ -519,3 +519,58 @@ flowchart LR
 - `codex-rs/core/src/session/mod.rs`
 - `codex-rs/protocol/src/openai_models.rs`
 
+## Quiz
+
+A local quiz generator is also included to help verify that someone understands
+the high-level architecture described in this report.
+
+Script:
+
+- `codex-rs/scripts/model_interaction_quiz.py`
+
+What it does:
+
+- generates a multiple-choice quiz from the model interaction report
+- includes at least 15 questions by default
+- randomizes question order and answer order
+- supports `--seed` for deterministic quiz generation
+- supports `--interactive` for one-question-at-a-time terminal use
+- supports `--show-answers` and `--markdown`
+
+### Run the quiz
+
+From the repo root:
+
+```bash
+python3 codex-rs/scripts/model_interaction_quiz.py
+```
+
+### Run the quiz interactively
+
+```bash
+python3 codex-rs/scripts/model_interaction_quiz.py --interactive
+```
+
+### Run the quiz with a fixed seed
+
+```bash
+python3 codex-rs/scripts/model_interaction_quiz.py --seed 7
+```
+
+### Show the answer key
+
+```bash
+python3 codex-rs/scripts/model_interaction_quiz.py --show-answers
+```
+
+### Generate markdown output
+
+```bash
+python3 codex-rs/scripts/model_interaction_quiz.py --markdown --show-answers > model-interaction-quiz.md
+```
+
+### Run the quiz tests
+
+```bash
+python3 -m unittest codex-rs/scripts/test_model_interaction_quiz.py
+```
